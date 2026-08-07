@@ -1,0 +1,346 @@
+=============================================
+Author: Ascendion AAVA
+Created on: 
+Description:
+Snowflake DDL for the Aviation Analytics Silver Layer, defining canonical, consolidated, standardized, and validated tables for airline, aircraft, event, airport, route, customer, data product, flight operations, flight events, aircraft maintenance, subscription, and flight history data.
+=============================================
+
+CREATE SCHEMA IF NOT EXISTS silver;
+
+-- ----------------------------------------------------------------------------
+-- SLV_AIRLINE
+-- Source: bronze.brz_airline_master
+-- Standardization: airline_code = IATA code if present else ICAO code;
+--                   carrier_type_code mapped to fixed domain
+--                   ('PASSENGER'|'CARGO'|'CHARTER'); operating_status mapped
+--                   to BOOLEAN active_flag.
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_airline;
+CREATE TABLE silver.slv_airline (
+    airline_code             VARCHAR(10)    NOT NULL,   -- standardized natural key (IATA-first)
+    iata_code                VARCHAR(3),
+    icao_code                VARCHAR(4),
+    airline_name             VARCHAR(200)   NOT NULL,
+    country                  VARCHAR(100),
+    alliance                 VARCHAR(100),
+    carrier_type             VARCHAR(50),          -- standardized: PASSENGER/CARGO/CHARTER
+    active_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    source_system            VARCHAR(100),
+    dq_valid_flag            BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason         VARCHAR(500),
+    created_ts               TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts               TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (airline_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_AIRCRAFT
+-- Source: bronze.brz_aircraft_registry
+-- Standardization: tail_number uppercased/trimmed of dashes; delivery_dt /
+--                   retirement_dt parsed to DATE; operator_code resolved to
+--                   slv_airline.airline_code.
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_aircraft;
+CREATE TABLE silver.slv_aircraft (
+    tail_number               VARCHAR(20)    NOT NULL,
+    aircraft_type             VARCHAR(100),
+    manufacturer              VARCHAR(100),
+    serial_number             VARCHAR(50),
+    delivery_date             DATE,
+    retirement_date           DATE,
+    operator_airline_code     VARCHAR(10),        -- FK -> slv_airline.airline_code
+    registry_country          VARCHAR(100),
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (tail_number),
+    FOREIGN KEY (operator_airline_code) REFERENCES silver.slv_airline (airline_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_EVENT_TYPE
+-- Source: bronze.brz_event_type_ref
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_event_type;
+CREATE TABLE silver.slv_event_type (
+    event_type_code           VARCHAR(20)    NOT NULL,
+    event_type_name           VARCHAR(200)   NOT NULL,
+    event_category            VARCHAR(100),
+    description               VARCHAR(1000),
+    active_flag               BOOLEAN        NOT NULL DEFAULT TRUE,
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (event_type_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_AIRPORT
+-- Source: bronze.brz_airport_master
+-- Standardization: airport_code = IATA if present else ICAO; lat/lon parsed
+--                   to DECIMAL(9,6) with range validation (-90/90, -180/180).
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_airport;
+CREATE TABLE silver.slv_airport (
+    airport_code              VARCHAR(10)    NOT NULL,   -- standardized natural key (IATA-first)
+    iata_code                 VARCHAR(3),
+    icao_code                 VARCHAR(4),
+    airport_name              VARCHAR(200),
+    city                      VARCHAR(100),
+    country                   VARCHAR(100),
+    region                    VARCHAR(100),
+    latitude                  NUMBER(9,6),
+    longitude                 NUMBER(9,6),
+    timezone                  VARCHAR(50),
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (airport_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_ROUTE
+-- Source: bronze.brz_route_master, validated against slv_airport
+-- Standardization: route_id = origin_airport_code || '-' || destination_airport_code;
+--                   dom_intl_flag mapped 'D'->'DOMESTIC','I'->'INTERNATIONAL'.
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_route;
+CREATE TABLE silver.slv_route (
+    route_id                  VARCHAR(30)    NOT NULL,   -- e.g. 'JFK-LHR'
+    origin_airport_code       VARCHAR(10)    NOT NULL,   -- FK -> slv_airport.airport_code
+    destination_airport_code  VARCHAR(10)    NOT NULL,   -- FK -> slv_airport.airport_code
+    route_distance_miles      NUMBER(10,2),
+    region                    VARCHAR(100),
+    route_type                VARCHAR(50),
+    domestic_international    VARCHAR(20),        -- standardized: DOMESTIC/INTERNATIONAL
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (route_id),
+    FOREIGN KEY (origin_airport_code) REFERENCES silver.slv_airport (airport_code),
+    FOREIGN KEY (destination_airport_code) REFERENCES silver.slv_airport (airport_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_CUSTOMER
+-- Source: bronze.brz_customer
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_customer;
+CREATE TABLE silver.slv_customer (
+    customer_id               VARCHAR(50)    NOT NULL,   -- from sfdc_account_id
+    customer_name             VARCHAR(200)   NOT NULL,
+    customer_type             VARCHAR(50),
+    country                   VARCHAR(100),
+    segment                   VARCHAR(100),
+    active_flag               BOOLEAN        NOT NULL DEFAULT TRUE,
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (customer_id)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_DATA_PRODUCT
+-- Source: bronze.brz_data_product
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_data_product;
+CREATE TABLE silver.slv_data_product (
+    product_code              VARCHAR(50)    NOT NULL,
+    product_name              VARCHAR(200)   NOT NULL,
+    domain                    VARCHAR(100),
+    delivery_type             VARCHAR(50),
+    description               VARCHAR(1000),
+    active_flag               BOOLEAN        NOT NULL DEFAULT TRUE,
+    source_system             VARCHAR(100),
+    dq_valid_flag             BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason          VARCHAR(500),
+    created_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (product_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_FLIGHT_OPERATIONS   ***CONSOLIDATION TABLE (4-way)***
+-- Sources:
+--   bronze.brz_flight_schedule            (planned schedule)
+--   bronze.brz_flight_tracking_flightaware (actuals, ADS-B provider #1)
+--   bronze.brz_flight_tracking_fr24        (actuals, ADS-B provider #2)
+--   bronze.brz_airline_ooooi_feed          (actuals, direct airline OOOI messages;
+--                                            4 rows per leg -- OUT/OFF/ON/IN --
+--                                            pivoted here into single
+--                                            actual_departure_ts / actual_arrival_ts
+--                                            values before merge)
+-- Matching: all four sources are joined on carrier_code + flight_number +
+--           flight_date (FlightAware/FR24 matched via tail_number/callsign
+--           resolution to carrier+flight_number where needed).
+-- Provider precedence for actual times (most to least authoritative):
+--           brz_airline_ooooi_feed  >  brz_flight_tracking_flightaware  >
+--           brz_flight_tracking_fr24
+--           i.e. COALESCE(ooooi_value, flightaware_value, fr24_value).
+--           The winning provider is recorded in actual_departure_source /
+--           actual_arrival_source for auditability.
+-- Standardization: all raw string dates/times parsed to TIMESTAMP; delay and
+--                   block-hour metrics computed rather than sourced.
+-- Validation: origin/destination must resolve to a known slv_airport row;
+--             carrier_code must resolve to a known slv_airline row.
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_flight_operations;
+CREATE TABLE silver.slv_flight_operations (
+    flight_id                  VARCHAR(60)    NOT NULL,   -- generated: carrier+flight_num+flight_date hash
+    schedule_id                VARCHAR(50),
+    carrier_code               VARCHAR(10)    NOT NULL,   -- FK -> slv_airline.airline_code
+    flight_number              VARCHAR(10),
+    tail_number                VARCHAR(20),               -- FK -> slv_aircraft.tail_number (nullable)
+    origin_airport_code        VARCHAR(10)    NOT NULL,   -- FK -> slv_airport.airport_code
+    destination_airport_code   VARCHAR(10)    NOT NULL,   -- FK -> slv_airport.airport_code
+    route_id                   VARCHAR(30),               -- FK -> slv_route.route_id
+    flight_date                DATE           NOT NULL,   -- derived from scheduled_departure_ts
+    scheduled_departure_ts     TIMESTAMP,
+    actual_departure_ts        TIMESTAMP,          -- merged across the 3 actuals sources, by precedence
+    actual_departure_source    VARCHAR(30),        -- NEW: which source won ('OOOOI'|'FLIGHTAWARE'|'FR24')
+    scheduled_arrival_ts       TIMESTAMP,
+    actual_arrival_ts          TIMESTAMP,          -- merged across the 3 actuals sources, by precedence
+    actual_arrival_source      VARCHAR(30),        -- NEW: which source won
+    delay_minutes              INTEGER,       -- computed: actual_departure_ts - scheduled_departure_ts
+    taxi_out_minutes           INTEGER,       -- from OOOOI (OFF-OUT) when available, else provider value
+    taxi_in_minutes            INTEGER,       -- from OOOOI (IN-ON) when available, else provider value
+    flight_distance_miles      NUMBER(10,2),
+    block_hours                NUMBER(6,2),  -- computed from gate-to-gate actuals
+    cancelled_flag             BOOLEAN        NOT NULL DEFAULT FALSE,
+    diverted_flag              BOOLEAN        NOT NULL DEFAULT FALSE,
+    source_system              VARCHAR(100),   -- concatenation of all contributing sources
+    dq_valid_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason           VARCHAR(500),
+    created_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (flight_id),
+    FOREIGN KEY (carrier_code) REFERENCES silver.slv_airline (airline_code),
+    FOREIGN KEY (tail_number) REFERENCES silver.slv_aircraft (tail_number),
+    FOREIGN KEY (origin_airport_code) REFERENCES silver.slv_airport (airport_code),
+    FOREIGN KEY (destination_airport_code) REFERENCES silver.slv_airport (airport_code),
+    FOREIGN KEY (route_id) REFERENCES silver.slv_route (route_id)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_FLIGHT_EVENTS
+-- Source: bronze.brz_flight_events (SUPER payload parsed into structured columns)
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_flight_events;
+CREATE TABLE silver.slv_flight_events (
+    event_id                   VARCHAR(64)    NOT NULL,   -- from message_id
+    flight_id                  VARCHAR(60),                -- FK -> slv_flight_operations (nullable)
+    event_type_code            VARCHAR(20),                -- FK -> slv_event_type.event_type_code
+    event_timestamp            TIMESTAMP      NOT NULL,
+    producer_system            VARCHAR(100),
+    consumer_system            VARCHAR(100),
+    message_size_bytes         INTEGER,
+    event_count                INTEGER        NOT NULL DEFAULT 1,
+    source_system              VARCHAR(100),
+    dq_valid_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason           VARCHAR(500),
+    created_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (event_id),
+    FOREIGN KEY (flight_id) REFERENCES silver.slv_flight_operations (flight_id),
+    FOREIGN KEY (event_type_code) REFERENCES silver.slv_event_type (event_type_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_AIRCRAFT_MAINTENANCE   ***CONSOLIDATION TABLE (header + 3 detail feeds)***
+-- Sources: bronze.brz_mro_work_order (header, one row per work order) +
+--          bronze.brz_mro_labor (many rows per work order) +
+--          bronze.brz_mro_parts (many rows per work order) +
+--          bronze.brz_mro_discrepancy (many rows per work order)
+-- Grain: one row per work order (matches brz_mro_work_order header grain).
+-- Key distinction: downtime_hours (elapsed aircraft-out-of-service time,
+-- from the header's close_ts - open_ts) is NOT the same as total_labor_hours
+-- (SUM of labor lines) -- multiple technicians can work a work order in
+-- parallel, so labor hours can exceed elapsed downtime. Both are kept.
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_aircraft_maintenance;
+CREATE TABLE silver.slv_aircraft_maintenance (
+    maintenance_id             VARCHAR(50)    NOT NULL,   -- from brz_mro_work_order.work_order_id
+    tail_number                VARCHAR(20)    NOT NULL,   -- FK -> slv_aircraft.tail_number
+    maintenance_type           VARCHAR(50),               -- from brz_mro_work_order.wo_type_cd
+    maintenance_start_ts       TIMESTAMP,                  -- from brz_mro_work_order.open_ts
+    maintenance_end_ts         TIMESTAMP,                  -- from brz_mro_work_order.close_ts
+    downtime_hours             NUMBER(10,2),              -- computed: close_ts - open_ts (elapsed, header grain)
+    total_labor_hours          NUMBER(10,2),              -- NEW: SUM(brz_mro_labor.labor_hours) for this work order
+    primary_technician_id      VARCHAR(50),                -- NEW: technician with the most labor hours on this work order
+    parts_count                INTEGER,                    -- NEW: COUNT(brz_mro_parts rows) for this work order
+    discrepancy_count          INTEGER,                    -- NEW: COUNT(brz_mro_discrepancy rows) for this work order
+    station_code               VARCHAR(10),
+    source_system              VARCHAR(100),
+    dq_valid_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason           VARCHAR(500),
+    created_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (maintenance_id),
+    FOREIGN KEY (tail_number) REFERENCES silver.slv_aircraft (tail_number)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_SUBSCRIPTION
+-- Source: bronze.brz_subscription
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_subscription;
+CREATE TABLE silver.slv_subscription (
+    subscription_id            VARCHAR(50)    NOT NULL,
+    customer_id                VARCHAR(50)    NOT NULL,   -- FK -> slv_customer.customer_id
+    product_code               VARCHAR(50)    NOT NULL,   -- FK -> slv_data_product.product_code
+    start_date                 DATE,
+    end_date                   DATE,
+    subscription_tier          VARCHAR(50),
+    subscription_status        VARCHAR(50),
+    source_system              VARCHAR(100),
+    dq_valid_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason           VARCHAR(500),
+    created_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (subscription_id),
+    FOREIGN KEY (customer_id) REFERENCES silver.slv_customer (customer_id),
+    FOREIGN KEY (product_code) REFERENCES silver.slv_data_product (product_code)
+);
+
+-- ----------------------------------------------------------------------------
+-- SLV_FLIGHT_HISTORY
+-- Source: bronze.brz_flight_history_archive
+-- ----------------------------------------------------------------------------
+DROP TABLE IF EXISTS silver.slv_flight_history;
+CREATE TABLE silver.slv_flight_history (
+    history_id                 VARCHAR(50)    NOT NULL,   -- from legacy_flight_id
+    carrier_code               VARCHAR(10),                -- FK -> slv_airline.airline_code
+    origin_airport_code        VARCHAR(10),                -- FK -> slv_airport.airport_code
+    destination_airport_code   VARCHAR(10),                -- FK -> slv_airport.airport_code
+    route_id                   VARCHAR(30),                -- FK -> slv_route.route_id (derived)
+    flight_date                DATE           NOT NULL,
+    delay_minutes              INTEGER,
+    cancelled_flag             BOOLEAN        NOT NULL DEFAULT FALSE,
+    load_factor                NUMBER(5,2),
+    data_source                VARCHAR(100),
+    dq_valid_flag              BOOLEAN        NOT NULL DEFAULT TRUE,
+    dq_reject_reason           VARCHAR(500),
+    created_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts                 TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (history_id),
+    FOREIGN KEY (carrier_code) REFERENCES silver.slv_airline (airline_code),
+    FOREIGN KEY (origin_airport_code) REFERENCES silver.slv_airport (airport_code),
+    FOREIGN KEY (destination_airport_code) REFERENCES silver.slv_airport (airport_code),
+    FOREIGN KEY (route_id) REFERENCES silver.slv_route (route_id)
+);
+
+-- ============================================================================
+-- END OF SILVER LAYER DDL -- 12 canonical tables
+-- ============================================================================
+
+API Cost: $0.008
