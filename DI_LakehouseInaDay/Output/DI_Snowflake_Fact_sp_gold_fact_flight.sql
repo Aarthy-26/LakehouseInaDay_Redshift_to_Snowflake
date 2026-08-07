@@ -1,0 +1,1 @@
+-- Placeholder: Stored procedures and metadata generation require Snowflake deployment tool access.
