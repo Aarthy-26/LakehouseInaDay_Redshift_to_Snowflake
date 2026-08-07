@@ -5,7 +5,7 @@ _____________________________________________
 
 ## *Created on*: 
 
-## *Description*: Review of Snowflake stored procedure `gold.sp_load_fact_flight_operations` for metadata alignment, Snowflake compatibility, join integrity, coding standards, and transformation logic.
+## *Description*: Review of Snowflake stored procedure `gold.sp_load_fact_flight_operations` for Gold fact load (fact_flight_operations).
 
 ## *Version*: 1
 
@@ -14,96 +14,86 @@ _____________________________________________
 _____________________________________________
 
 ### Workflow Summary
-The input SQL Scripting stored procedure `gold.sp_load_fact_flight_operations` loads `FACT_FLIGHT_OPERATIONS` in the Gold layer from Silver table `SLV_FLIGHT_OPERATIONS` by filtering to `dq_valid_flag = TRUE`, looking up surrogate keys from Gold dimensions (`DIM_DATE`, `DIM_AIRLINE`, `DIM_AIRCRAFT`, `DIM_ROUTE`, `DIM_AIRPORT`), deduplicating by `flight_id` (latest `updated_ts`), and performing a `MERGE` into the target. It also writes start/end audit records to a provided audit table FQN and returns a VARIANT object with execution metadata.
-
-> Note: No mapping/metadata file was provided/read as part of the inputs (only the stored procedure SQL file was supplied). All mapping validations below are limited to what can be inferred from code comments and object names.
+This stored procedure (`gold.sp_load_fact_flight_operations`) loads data from `silver.slv_flight_operations` into the Gold fact table `gold.fact_flight_operations` using a `MERGE` (upsert). It filters to `dq_valid_flag = TRUE`, performs dimension lookups for airline/aircraft/airport (route lookup is currently a placeholder), deduplicates by `flight_id` using latest `src_updated_ts`, validates `date_key` is not null, merges into the target using `(schedule_id, date_key)` as the match key, and writes audit rows to a caller-supplied audit table.
 
 ---
 
 ## 1) Validation Against Metadata
+> Mapping/metadata files were **not provided** in the inputs; validation is limited to internal consistency and obvious model intent inferred from object names.
 
 | Item | Status | Details |
-|---|---:|---|
-| Mapping/metadata file(s) present in inputs | ❌ | Only `DI_LakehouseInaDay/Output/DI_Snowflake_Fact_sp_gold_fact_flight.sql` was provided. No mapping/metadata file was available to validate column-level rules. |
-| Source table(s) identified and consistent | ✅ | Source referenced as `IDENTIFIER(P_SILVER_DB || '.' || P_SILVER_SCHEMA || '.SLV_FLIGHT_OPERATIONS')`. |
-| Target table(s) identified and consistent | ✅ | Target resolved as `P_GOLD_DB.P_GOLD_SCHEMA.FACT_FLIGHT_OPERATIONS`. |
-| Column mapping validated vs metadata | ❌ | Cannot verify required/optional columns, datatypes, defaulting rules, and business keys without mapping/DDL metadata. |
-| Dimension lookups validated vs metadata | ❌ | Lookups are coded, but cannot confirm correct keys/attributes without dimension/table DDL or mapping. |
-| Audit table schema validated vs metadata | ❌ | Procedure inserts into `P_AUDIT_TABLE_FQN` columns `(procedure_name, target_table, start_ts, end_ts, status, rows_inserted, rows_updated, error_message)` but no audit table DDL provided to confirm these columns exist and types match. |
+|---|---|---|
+| Source table identified and referenced consistently | ✅ | Uses `silver.slv_flight_operations` in `src` CTE and downstream transformations. |
+| Target table identified and referenced consistently | ✅ | Uses `gold.fact_flight_operations` as MERGE target; `V_TARGET_TABLE` matches. |
+| Column-level mapping verified against mapping file | ❌ | No mapping/metadata file was provided, so mappings (e.g., `carrier_code → dim_airline.airline_key`, date_key derivation, merge key choice) cannot be confirmed. |
+| Data type consistency (inferred) between derived keys and target | ❌ | `date_key` derived as NUMBER; cannot confirm target column type without DDL/mapping. Same for all other columns. |
+| Natural/business key for fact identified per metadata | ❌ | Code comments state Gold DDL lacks deterministic natural key; merge uses `(schedule_id, date_key)` as best-effort. Needs confirmation via metadata. |
 
 ---
 
 ## 2) Compatibility with Snowflake
 
 | Item | Status | Details |
-|---|---:|---|
-| `CREATE OR REPLACE PROCEDURE` syntax correct | ✅ | Uses Snowflake SQL Scripting: `LANGUAGE SQL ... AS $$ ... $$;`. |
-| Parameter definitions valid | ✅ | Parameters are typed as `STRING`; used to build fully qualified names. |
-| Return type valid | ✅ | `RETURNS VARIANT` and returns `OBJECT_CONSTRUCT(...)`. |
-| Execution rights specified | ✅ | `EXECUTE AS CALLER` specified. |
-| SQL Scripting variable/assignment syntax valid | ✅ | Uses `DECLARE`, `:=` assignments, `IF ... THEN ... END IF;`. |
-| Use of `IDENTIFIER()` for dynamic objects valid | ✅ | Correct pattern for dynamic table references in SQL. |
-| Dynamic SQL with `EXECUTE IMMEDIATE ... USING` valid | ✅ | Parameter binding used for audit inserts to reduce injection risk for values (table name still dynamic). |
-| Transaction handling appropriate | ⚠️/❌ | No explicit transaction control. Depending on requirements, merge + audit inserts may need atomicity. In Snowflake procedures, statements run in a transaction by default unless autocommit/implicit behavior differs; clarify if audit should commit on failure. |
-| MERGE syntax valid | ✅ | Standard Snowflake `MERGE INTO ... USING ... ON ... WHEN MATCHED ... WHEN NOT MATCHED ...`. |
-| MERGE results rowcount capture valid | ⚠️/❌ | Uses `RESULT_SCAN(LAST_QUERY_ID())` and expects `$1/$2` labels `number of rows inserted/updated`. This pattern works for some DML (and historically for MERGE), but output format can vary. Safer: use `GET_DML_STATEMENT_STATS` (where available) or parse `QUERY_HISTORY` / `LAST_QUERY_ID()` carefully; verify in your Snowflake account. |
-| Exception handling valid | ✅ | Uses `EXCEPTION WHEN OTHER THEN ... SQLERRM ... RAISE;`. |
-| Unsupported/deprecated features used | ✅ | No obvious unsupported features observed. |
+|---|---|---|
+| `CREATE OR REPLACE PROCEDURE` syntax valid | ✅ | Uses Snowflake SQL procedure syntax. |
+| Procedure language appropriate and supported | ✅ | `LANGUAGE SQL` is supported (Snowflake Scripting). |
+| `EXECUTE AS` clause valid | ✅ | `EXECUTE AS CALLER` is valid. |
+| Return type valid and used consistently | ✅ | `RETURNS VARIANT` and returns `OBJECT_CONSTRUCT(...)`. |
+| Variable declarations valid for Snowflake Scripting | ⚠️/❌ | Uses `DECLARE ...` correctly, but later uses `LET v_merge_qid STRING := LAST_QUERY_ID();` inside procedure body. In Snowflake Scripting, `LET` is valid, but mixing `LET` and `DECLARE` can be confusing; also `v_merge_qid` casing differs from declared variables and is referenced with `:v_merge_qid` bind style. Recommend `DECLARE v_merge_qid STRING; v_merge_qid := LAST_QUERY_ID();` for clarity and to avoid bind issues. |
+| Bind variable usage (`INTO :var`, `TABLE(RESULT_SCAN(:qid))`) | ❌ | The code uses `INTO :V_ROWS_INSERTED, :V_ROWS_UPDATED` and `RESULT_SCAN(:v_merge_qid)`; bind syntax with `:` is typically for Snowflake clients. In Snowflake Scripting, variables are referenced without `:`. This may fail at runtime. |
+| Exception handling implemented correctly | ✅ | Uses `EXCEPTION WHEN OTHER THEN ... ERROR_MESSAGE(); RAISE STATEMENT_ERROR ...` pattern. |
+| Dynamic SQL with `EXECUTE IMMEDIATE ... USING` valid | ✅ | Uses parameter binding via `USING` for audit inserts. |
+| Unsupported/deprecated features used | ✅ | No obvious unsupported features detected; main risk is variable/bind syntax in SQL scripting context. |
+| Transaction handling appropriate | ❌ | No explicit transaction control (BEGIN TRANSACTION/COMMIT/ROLLBACK). For MERGE + audit logging, failure mid-way could leave partial audit entries. Needs a standard approach (either explicit transaction or idempotent audit strategy). |
 
 ---
 
 ## 3) Validation of Join Operations
 
 | Item | Status | Details |
-|---|---:|---|
-| Join columns exist and are meaningful (DIM_DATE) | ❌ | Join: `d.date = s.flight_date`. Cannot confirm `DIM_DATE.date` exists or datatype aligns with `flight_date` without DDL/metadata. |
-| Join columns exist and are meaningful (DIM_AIRLINE) | ❌ | Join: `a.airline_code = s.carrier_code`. Cannot confirm presence/types without DDL/metadata. |
-| Join columns exist and are meaningful (DIM_AIRCRAFT) | ❌ | Join: `ac.tail_number = s.tail_number` and date range on `effective_start_date/effective_end_date`. Cannot confirm presence/types without DDL/metadata. |
-| Join logic for route dimension is valid | ❌ | `lkp_route` join is effectively a no-op: `ON r.route_key IS NOT NULL AND r.route_key = r.route_key` is always true for non-null and does not reference source columns. This creates a many-to-many join (cartesian-like) and will explode row counts. Comment indicates a missing `dim_route.route_id` column needed for lookup by Silver `route_id`. |
-| Airport lookups join keys validated | ❌ | Joins: `airport_code = origin_airport_code` and `airport_code = destination_airport_code`. Cannot confirm columns/types without DDL/metadata. |
-| Join key datatype compatibility | ❌ | Cannot validate datatypes across joins without table DDL/metadata. |
-| Relationship integrity (1:1 vs 1:M) protected | ❌ | No constraints/qualify applied after each dimension lookup. If dimensions have duplicates on lookup columns, joins can multiply rows. Only final `QUALIFY` dedupes by `flight_id`, which may mask join explosions and produce nondeterministic key selection. |
+|---|---|---|
+| All joined tables exist and are referenced with correct schema qualifiers | ✅ | `gold.dim_airline`, `gold.dim_aircraft`, `gold.dim_airport`, `gold.dim_route` referenced consistently. |
+| Join columns exist in source/intermediate datasets | ❌ | Cannot confirm existence of `carrier_code`, `tail_number`, `origin_airport_code`, etc. without table DDLs or metadata. Must be validated against `silver.slv_flight_operations` definition. |
+| Join predicates are meaningful and non-placeholder | ❌ | `gold.dim_route` join is `ON dr.route_key IS NOT NULL` (and in earlier CTE even duplicated joins/placeholder `EXISTS (SELECT 1)`). This is effectively a Cartesian-ish filter and will produce incorrect results / row explosion. |
+| Join cardinality/integrity controlled (no unintended duplication) | ❌ | `dim_route` join as written can multiply rows. Also, `dim_airline` join assumes uniqueness on `airline_code`; without constraint/QUALIFY, duplicates could multiply fact rows. |
+| SCD2 lookup logic for aircraft is correct | ✅ | `flight_date BETWEEN effective_start_date AND COALESCE(effective_end_date, '9999-12-31')` is standard point-in-time. Confirm date types to avoid implicit casts. |
+| Duplicate join blocks / syntax issues in joins | ❌ | In `xform` CTE, `LEFT JOIN gold.dim_route dr` appears twice with same alias `dr` which is invalid SQL (duplicate alias). Although `xform` is not used later, it will still be parsed and will fail compilation. |
 
 ---
 
 ## 4) Syntax and Code Review
 
 | Item | Status | Details |
-|---|---:|---|
-| Stored procedure compiles in Snowflake SQL Scripting | ❌ | `MERGE ... USING final_rows src` is invalid because `final_rows` is a CTE and must be referenced as `(SELECT ... FROM final_rows)` or inline CTE in `USING` clause is not directly addressable in that position. In Snowflake, you can do `USING (SELECT * FROM final_rows) src`. |
-| MERGE `ON` clause uses correct business key | ❌ | `ON tgt.schedule_id = src.flight_id` appears mismatched: compares `schedule_id` to `flight_id`. Comment also states Gold DDL lacks `flight_id`. This likely breaks matching logic and causes incorrect updates/inserts. |
-| Target columns referenced in UPDATE/INSERT exist | ❌ | Cannot confirm target columns exist (no target DDL). Additionally, `flight_id` is not inserted, but used for dedupe and merge match; indicates mismatch with target model. |
-| Source columns referenced exist | ❌ | References many columns (`dq_valid_flag`, `flight_date`, `carrier_code`, `tail_number`, `updated_ts`, etc.). Without Silver table DDL/metadata, cannot confirm. |
-| Naming conventions | ⚠️/❌ | Procedure name `gold.sp_load_fact_flight_operations` does not follow the suggested `SP_<DOMAIN>_<ACTION>` convention (upper-case prefix). If your standard allows schema-qualified lower-case `sp_...` it may be acceptable; otherwise rename. |
-| Use of comments / clarity | ✅ | Comments clearly indicate known skipped mappings/issues (route lookup and business key). |
+|---|---|---|
+| Procedure compiles (no obvious SQL compilation blockers) | ❌ | `xform` CTE contains duplicate `LEFT JOIN gold.dim_route dr` with same alias; this will cause compilation failure even if `xform` is unused. Also `QUALIFY 1=1` is unnecessary and may indicate unfinished logic. |
+| Object naming conventions | ✅ | `gold.sp_load_fact_flight_operations` is descriptive and consistent with domain/action. |
+| Consistent aliasing and readability | ❌ | Two separate transformation approaches (`xform` then `resolved`), but `xform` is unused. Duplicate joins and placeholder comments should be removed. |
+| MERGE match condition aligns with intended grain | ❌ | Uses `(schedule_id, date_key)` but dedup is by `flight_id`. If schedule_id is not unique per day, updates/inserts may be incorrect. Needs a deterministic business key per model. |
+| Use of reserved words / quoting issues | ✅ | No obvious reserved-word conflicts in identifiers. |
 
 ---
 
 ## 5) Compliance with Development Standards
 
 | Item | Status | Details |
-|---|---:|---|
-| Modular design (CTEs for stages) | ✅ | Uses staged CTEs for each lookup step. |
-| Logging/auditing implemented | ✅ | Writes start/end entries to an audit table; returns execution metadata. |
-| Audit logging on failure | ✅ | Exception block writes failure audit with `SQLERRM`. |
-| Guard against audit self-write | ✅ | Checks target table FQN vs audit table FQN before inserting audit rows. |
-| SQL injection risk controlled | ⚠️/❌ | Values are bound via `USING`, but `P_AUDIT_TABLE_FQN` and constructed target FQN are concatenated directly into SQL. If these parameters are user-controlled, object-name injection is possible. Consider validating against allowed patterns / whitelisting DB+schema+table names. |
-| Consistent formatting and readability | ✅ | Formatting is consistent and readable. |
+|---|---|---|
+| Parameter validation | ❌ | Does not validate `P_AUDIT_TABLE_FQN` is non-null/non-empty and exists. Dynamic insert will fail with unclear error if invalid. |
+| Logging/auditing implemented | ✅ | Writes pre/post rows with status and counts; includes guard to avoid recursion. |
+| Row count metrics captured reliably | ❌ | MERGE result parsing relies on `RESULT_SCAN` with bind syntax that may be incorrect in SQL scripting; may fail or return 0. |
+| Idempotency/re-runnability | ❌ | Depends on merge key; if incorrect, reruns could overwrite or duplicate. Also audit pre-step always inserts RUNNING row; no update of same row, may create duplicates. |
+| Formatting and modularity | ❌ | Contains dead/unreferenced CTE (`xform`) and placeholder joins; should be cleaned before production. |
 
 ---
 
 ## 6) Validation of Transformation Logic
 
 | Item | Status | Details |
-|---|---:|---|
-| DQ filter applied correctly | ✅ | `WHERE s.dq_valid_flag = TRUE`. |
-| Date surrogate key derivation | ❌ | `lkp_date` uses LEFT JOIN but does not enforce `date_key` presence. Comment says “must have date_key”, but no filter like `WHERE d.date_key IS NOT NULL`. Missing keys may flow into fact as NULL. |
-| Airline surrogate key derivation | ⚠️/❌ | LEFT JOIN allows null `airline_key`; no enforcement or default unknown member handling shown. |
-| Aircraft SCD range logic | ✅ | Uses `flight_date BETWEEN effective_start_date AND COALESCE(effective_end_date, '9999-12-31'::DATE)`; reasonable SCD2 filter assuming types align. |
-| Route surrogate key derivation | ❌ | Route lookup is incorrect/no-op and will cause row explosion or arbitrary `route_key` selection after final dedupe. |
-| Airport key derivation | ⚠️/❌ | LEFT JOIN allows NULL airport keys; no enforcement/unknown handling. |
-| Deduplication logic correct and deterministic | ⚠️/❌ | `QUALIFY ROW_NUMBER() ... ORDER BY s.updated_ts DESC` assumes `updated_ts` exists and is non-null; if ties occur, nondeterministic selection. Add secondary sort (e.g., ingestion timestamp) for determinism. |
-| MERGE update/insert column alignment | ❌ | Merge match key mismatch (`schedule_id` vs `flight_id`). Also `schedule_id` is set from `src.schedule_id` but match uses `src.flight_id`; indicates confusion between natural keys. |
+|---|---|---|
+| Filter on DQ-valid rows applied as intended | ✅ | `WHERE s.dq_valid_flag = TRUE`. |
+| `date_key` derivation correct and consistent | ✅ | Uses `TO_NUMBER(TO_CHAR(flight_date,'YYYYMMDD'))`. Must confirm `flight_date` is DATE/TIMESTAMP. |
+| Dimension key resolution logic correct | ❌ | `dim_route` key resolution is not implemented; currently uses placeholder join. This will set `route_key` arbitrarily/non-deterministically and can multiply rows. |
+| Deduplication logic consistent with merge key | ❌ | Dedup uses `flight_id` but merge matches on `(schedule_id, date_key)`. If these represent different grains, dedup may not prevent duplicates and updates may be wrong. |
+| Data quality assertions adequate | ❌ | Only checks `date_key IS NULL`. Missing checks for mandatory FKs (airline/aircraft/airports), negative measures, timestamp ordering, etc. (as per expected model). |
 
 ---
 
@@ -111,19 +101,19 @@ The input SQL Scripting stored procedure `gold.sp_load_fact_flight_operations` l
 
 | Finding (❌) | Impact | Recommendation / Fix |
 |---|---|---|
-| No mapping/metadata files provided | Cannot validate column-level mapping, datatypes, and required business keys | Add mapping file(s) and/or DDL for Silver/Gold tables and dimensions to the input set. Re-run review with these artifacts. |
-| `lkp_route` join is invalid/no-op (`r.route_key = r.route_key`) | Severe: row explosion, incorrect `route_key`, wrong fact grain | Implement proper join to `DIM_ROUTE` using a real business key from Silver (e.g., `s.route_id`) and a corresponding dimension attribute (e.g., `r.route_id`). If `DIM_ROUTE` lacks that column, update the dimension model/DDL to include it or create a bridge/lookup table. |
-| MERGE `USING final_rows src` references CTE directly | Procedure may fail to compile/run | Change to `USING (SELECT * FROM final_rows) src` (or inline the `final_rows` SELECT directly in the USING clause). |
-| MERGE `ON` condition mismatched (`tgt.schedule_id = src.flight_id`) | Incorrect upserts: duplicates, missed updates, wrong matches | Align business key. Either: (a) include `flight_id` in target and match on it; or (b) match on `schedule_id` to `src.schedule_id` if that is the intended natural key. Update comments and mapping accordingly. |
-| Cannot verify join column existence/types for all dimension lookups | Risk of runtime failures (invalid identifiers) or implicit casts hurting performance | Provide/verify DDL for `SLV_FLIGHT_OPERATIONS`, `DIM_DATE`, `DIM_AIRLINE`, `DIM_AIRCRAFT`, `DIM_ROUTE`, `DIM_AIRPORT`, `FACT_FLIGHT_OPERATIONS`. Ensure join columns exist and datatypes align (DATE vs TIMESTAMP, VARCHAR lengths, etc.). |
-| No enforcement of required surrogate keys (e.g., `date_key`) | Facts may load with NULL foreign keys, breaking downstream analytics | If keys are mandatory, filter out rows where key lookup fails (`WHERE date_key IS NOT NULL`) or map to an "Unknown" member key (e.g., 0 or -1) consistently across dimensions. |
-| Potential dimension duplicates not controlled | Many-to-many joins can multiply rows and create nondeterministic key selection | Ensure dimension uniqueness on lookup attributes (constraints or dedupe subqueries). Consider `QUALIFY ROW_NUMBER()` on each dimension join or pre-aggregate dimensions to distinct keys before joining. |
-| Object-name injection risk via concatenated FQNs | Security risk in multi-tenant / parameterized execution | Validate input parameters to allow only expected database/schema/table names (regex + whitelist), or avoid passing raw FQNs from untrusted contexts. |
-| Rowcount capture via `RESULT_SCAN(LAST_QUERY_ID())` may be brittle | Incorrect audit metrics if result format differs | Validate in environment. If unreliable, query `INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION` for the last query and parse `ROWS_INSERTED/ROWS_UPDATED` where available, or maintain counts via staged temp table approach. |
+| Missing mapping/metadata inputs | Cannot confirm correctness of mappings, data types, business keys | Add mapping/metadata file(s) (source/target DDL, column mapping) to review set. Re-validate all derived columns and merge keys. |
+| `xform` CTE has duplicate joins with alias `dr` and is unused | Procedure likely fails to compile; dead code increases risk | Remove `xform` CTE entirely or fix it. Ensure each join alias is unique and only one `dim_route` join exists. |
+| `dim_route` join is placeholder (`dr.route_key IS NOT NULL`) | Produces incorrect `route_key` and can cause row multiplication | Implement route lookup using a natural key (e.g., `s.route_id` or `(origin,destination)`); update `dim_route` to store that natural key if missing. Replace placeholder join with deterministic predicate. |
+| Variable/bind syntax likely incorrect for Snowflake Scripting (`INTO :V_STATUS`, `RESULT_SCAN(:v_merge_qid)`) | Runtime failures or incorrect row counts; compilation may fail depending on parser | Use Snowflake Scripting variable references without `:`. Example: `SELECT ... INTO V_ROWS_INSERTED, V_ROWS_UPDATED FROM TABLE(RESULT_SCAN(v_merge_qid));` and `SELECT ... INTO V_STATUS ...`. Also prefer `DECLARE v_merge_qid STRING; v_merge_qid := LAST_QUERY_ID();`. |
+| Merge key not confirmed and potentially inconsistent with dedup grain | Incorrect updates/inserts, duplicates, data drift | Define and document fact grain and natural key in Gold DDL/metadata (e.g., `flight_id` or `(flight_id,date_key)`), then align `MERGE ON` and dedup partition to that key. |
+| Join integrity not guaranteed (dim duplicates, missing FK checks) | Row multiplication, non-deterministic key assignment, FK nulls | Enforce dimension uniqueness (e.g., `QUALIFY ROW_NUMBER()` in dimension subquery) or add constraints/logic. Add DQ checks for mandatory keys and handle unknown members. |
+| No explicit transaction strategy with audit logging | Partial audit rows or partial data changes on failure | Consider wrapping MERGE + post-audit in a transaction, or write audit using update-in-place (single audit row per run) keyed by run_id. |
+| Limited DQ assertions | Bad data can enter Gold | Add validations: non-null required fields, timestamp order (dep ≤ arr), non-negative durations/distances, etc., based on business rules in mapping. |
 
 ---
 
-### Overall Readiness
-- **Compilation/Runtime readiness:** ❌ (route join and MERGE USING syntax/match key issues must be fixed)
-- **Metadata conformance:** ❌ (missing mapping/DDL inputs)
-- **Join integrity:** ❌ (route join is invalid; other joins unverified without DDL)
+### Open Items (Needs Input / Manual Confirmation)
+1. Provide DDL for `silver.slv_flight_operations` and `gold.fact_flight_operations` to validate column existence and data types.
+2. Provide DDL and natural key design for `gold.dim_route` (and how to map from `slv_flight_operations.route_id` or origin/destination codes).
+3. Confirm the intended business key/grain for `gold.fact_flight_operations` and required uniqueness constraints.
+4. Confirm audit table schema (required columns and types) for `P_AUDIT_TABLE_FQN`.
